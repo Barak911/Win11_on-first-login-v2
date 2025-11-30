@@ -539,18 +539,50 @@ function Install-DriversForPresentDevices {
         [string]$DriverFolderPath,
         [string]$PnPUtilExe
     )
-    
+
     # Exit codes reference:
     # 0    = Success
     # 259  = No more data / already installed
     # 3010 = Success, reboot required
-    $stats = @{ 
+    # -536870353 (0xE000020F) = Cannot install inbox/protected driver
+    $stats = @{
         Installed     = 0
         Updated       = 0
         Failed        = 0
         Skipped       = 0
         RebootNeeded  = $false
     }
+
+    # Windows inbox drivers that cannot be replaced via pnputil
+    # These are protected system drivers and will fail with exit code -536870353
+    $InboxDriversToSkip = @(
+        'bth.inf',           # Microsoft Bluetooth Enumerator
+        'bthleenum.inf',     # Microsoft Bluetooth LE Enumerator
+        'bthpan.inf',        # Bluetooth Device (Personal Area Network)
+        'tdibth.inf',        # Bluetooth Device (RFCOMM Protocol TDI)
+        'monitor.inf',       # Generic Monitor
+        'tpm.inf',           # Trusted Platform Module
+        'disk.inf',          # Disk Drive
+        'volume.inf',        # Volume
+        'keyboard.inf',      # Standard keyboards
+        'msmouse.inf',       # Microsoft Mouse
+        'usbhub.inf',        # Generic USB Hub
+        'usbport.inf',       # USB Host Controller
+        'usbstor.inf',       # USB Mass Storage
+        'cdrom.inf',         # CD-ROM Drive
+        'machine.inf',       # Computer System
+        'cpu.inf',           # Processor
+        'acpi.inf',          # ACPI components
+        'pci.inf',           # PCI Bus
+        'hdaudbus.inf',      # Microsoft UAA Bus Driver for High Definition Audio
+        'wdma_usb.inf',      # USB Audio Device
+        'ks.inf',            # Kernel Streaming
+        'kscaptur.inf',      # WDM Streaming Capture Devices
+        'msports.inf',       # Communications Port
+        'mssmbios.inf',      # Microsoft System Management BIOS Driver
+        'swenum.inf',        # Software Device Enumerator
+        'umbus.inf'          # UMBus Enumerator
+    )
     
     # Get all relevant devices in one query
     $devices = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
@@ -581,20 +613,34 @@ function Install-DriversForPresentDevices {
     
     # Process INF files - only install if matching device exists
     $infFiles = Get-ChildItem -Path $DriverFolderPath -Filter "*.inf" -Recurse -ErrorAction SilentlyContinue
-    $processedInfs = @{}  # Track which INFs we've already installed
-    
+    $processedInfNames = @{}  # Track by filename (not full path) to avoid duplicates
+
     foreach ($inf in $infFiles) {
+        $infNameLower = $inf.Name.ToLower()
+
+        # Skip Windows inbox drivers that cannot be installed via pnputil
+        if ($InboxDriversToSkip -contains $infNameLower) {
+            Write-Log "Skipping inbox driver: $($inf.Name)" -Level INFO
+            $stats.Skipped++
+            continue
+        }
+
+        # Skip if we've already processed an INF with this filename
+        if ($processedInfNames.ContainsKey($infNameLower)) {
+            continue
+        }
+
         $content = Get-Content -Path $inf.FullName -Raw -ErrorAction SilentlyContinue
         if (-not $content) { continue }
-        
+
         # Expanded regex to cover more hardware ID types:
         # PCI, USB, ACPI, HDAUDIO, HID, DISPLAY, MONITOR, BTH, BTHENUM, SWC
         $hwIdPattern = '(PCI\\VEN_[0-9A-Fa-f]{4}&DEV_[0-9A-Fa-f]{4}[^\s,"]*|USB\\VID_[0-9A-Fa-f]{4}&PID_[0-9A-Fa-f]{4}[^\s,"]*|ACPI\\[A-Za-z0-9_]+|HDAUDIO\\[^\s,"]+|HID\\[^\s,"]+|DISPLAY\\[^\s,"]+|MONITOR\\[^\s,"]+|BTH\\[^\s,"]+|BTHENUM\\[^\s,"]+|SWC\\[^\s,"]+)'
         $hwIdMatches = [regex]::Matches($content, $hwIdPattern, 'IgnoreCase')
-        
+
         $shouldInstall = $false
         $matchedDevice = $null
-        
+
         foreach ($m in $hwIdMatches) {
             $hwIdUpper = $m.Value.ToUpper()
             if ($deviceLookup.ContainsKey($hwIdUpper)) {
@@ -603,16 +649,18 @@ function Install-DriversForPresentDevices {
                 break
             }
         }
-        
-        if ($shouldInstall -and -not $processedInfs.ContainsKey($inf.FullName)) {
-            $processedInfs[$inf.FullName] = $true
+
+        if ($shouldInstall) {
+            # Mark this INF filename as processed to avoid duplicate installs
+            $processedInfNames[$infNameLower] = $true
+
             $deviceName = if ($matchedDevice.FriendlyName) { $matchedDevice.FriendlyName } else { $matchedDevice.InstanceId }
             $isProblem = ($matchedDevice.Status -ne 'OK') -or ($matchedDevice.ConfigManagerErrorCode -ne 0)
-            
+
             Write-Log "Installing: $($inf.Name) for $deviceName"
-            
+
             $null = & $PnPUtilExe /add-driver $inf.FullName /install 2>&1
-            
+
             switch ($LASTEXITCODE) {
                 0 {
                     if ($isProblem) {
