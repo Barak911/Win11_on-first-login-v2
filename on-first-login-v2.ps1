@@ -589,9 +589,12 @@ function Install-DriversForPresentDevices {
         $_.InstanceId -notmatch '^(ROOT\\|HTREE\\|SW\\)' -and
         $_.Class -notin @('System', 'Computer', 'Volume', 'DiskDrive', 'CDROM', 'Processor')
     }
-    
+
     # Build hardware ID lookup for all devices at once
+    # Store both full hardware IDs and shortened versions for flexible matching
     $deviceLookup = @{}
+    $deviceHwIdList = @()  # Store all device hardware IDs for prefix matching
+
     foreach ($device in $devices) {
         try {
             $hwIds = (Get-PnpDeviceProperty -InstanceId $device.InstanceId -KeyName 'DEVPKEY_Device_HardwareIds' -ErrorAction SilentlyContinue).Data
@@ -602,10 +605,32 @@ function Install-DriversForPresentDevices {
                         $deviceLookup[$key] = @()
                     }
                     $deviceLookup[$key] += $device
+                    $deviceHwIdList += @{ HwId = $key; Device = $device }
+
+                    # Also store shortened PCI/USB hardware IDs (VEN+DEV / VID+PID only)
+                    # This enables matching when INF has generic ID and device has specific one
+                    if ($key -match '^(PCI\\VEN_[0-9A-F]{4}&DEV_[0-9A-F]{4})') {
+                        $shortKey = $Matches[1]
+                        if (-not $deviceLookup.ContainsKey($shortKey)) {
+                            $deviceLookup[$shortKey] = @()
+                        }
+                        if ($deviceLookup[$shortKey] -notcontains $device) {
+                            $deviceLookup[$shortKey] += $device
+                        }
+                    }
+                    elseif ($key -match '^(USB\\VID_[0-9A-F]{4}&PID_[0-9A-F]{4})') {
+                        $shortKey = $Matches[1]
+                        if (-not $deviceLookup.ContainsKey($shortKey)) {
+                            $deviceLookup[$shortKey] = @()
+                        }
+                        if ($deviceLookup[$shortKey] -notcontains $device) {
+                            $deviceLookup[$shortKey] += $device
+                        }
+                    }
                 }
             }
         } catch {
-            Write-Log "Failed to get HW IDs for $($device.InstanceId): $_" -Level DEBUG
+            # Silently skip devices we can't query
         }
     }
     
@@ -643,11 +668,24 @@ function Install-DriversForPresentDevices {
 
         foreach ($m in $hwIdMatches) {
             $hwIdUpper = $m.Value.ToUpper()
+
+            # First try exact match
             if ($deviceLookup.ContainsKey($hwIdUpper)) {
                 $shouldInstall = $true
                 $matchedDevice = $deviceLookup[$hwIdUpper][0]
                 break
             }
+
+            # Then try prefix matching - INF hardware ID might be a prefix of device hardware ID
+            # e.g., INF has "PCI\VEN_8086&DEV_A0A3" and device has "PCI\VEN_8086&DEV_A0A3&SUBSYS_..."
+            foreach ($entry in $deviceHwIdList) {
+                if ($entry.HwId.StartsWith($hwIdUpper)) {
+                    $shouldInstall = $true
+                    $matchedDevice = $entry.Device
+                    break
+                }
+            }
+            if ($shouldInstall) { break }
         }
 
         if ($shouldInstall) {
