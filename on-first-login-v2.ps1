@@ -143,6 +143,233 @@ if (-not $ImageResourcesPath) {
 }
 
 # =========================
+# 0.5) OneDrive Removal (Early - before user accounts)
+# =========================
+Write-Log "ONEDRIVE REMOVAL" -Level SECTION
+
+function Remove-OneDriveCompletely {
+    <#
+    .SYNOPSIS
+        Completely removes Microsoft OneDrive from Windows 11, including all files, registry entries, and services.
+    .DESCRIPTION
+        This function performs a comprehensive removal of OneDrive:
+        - Stops all OneDrive processes
+        - Uninstalls via OneDriveSetup.exe /uninstall
+        - Removes AppX package for all users
+        - Cleans up all OneDrive folders
+        - Removes registry entries (including Explorer sidebar)
+        - Stops and disables OneSyncSvc service
+        - Prevents automatic reinstallation via Group Policy
+    #>
+
+    Write-Log "Starting comprehensive OneDrive removal..." -Level INFO
+
+    # ===== 1. Stop OneDrive Processes =====
+    Write-Log "  Stopping OneDrive processes..." -Level INFO
+    $processNames = @('OneDrive', 'OneDriveSetup', 'FileCoAuth')
+    foreach ($proc in $processNames) {
+        Get-Process -Name $proc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Seconds 3
+
+    # ===== 2. Uninstall OneDrive via Setup executable =====
+    Write-Log "  Running OneDrive uninstaller..." -Level INFO
+    $oneDriveSetupPaths = @(
+        "$env:SystemRoot\System32\OneDriveSetup.exe",
+        "$env:SystemRoot\SysWOW64\OneDriveSetup.exe",
+        "$env:LOCALAPPDATA\Microsoft\OneDrive\OneDriveSetup.exe",
+        "$env:ProgramFiles\Microsoft OneDrive\OneDriveSetup.exe",
+        "${env:ProgramFiles(x86)}\Microsoft OneDrive\OneDriveSetup.exe"
+    )
+
+    $uninstalled = $false
+    foreach ($setupPath in $oneDriveSetupPaths) {
+        if (Test-Path $setupPath) {
+            try {
+                $proc = Start-Process -FilePath $setupPath -ArgumentList '/uninstall' -Wait -PassThru -NoNewWindow -ErrorAction Stop
+                if ($proc.ExitCode -eq 0) {
+                    Write-Log "    Uninstalled via: $setupPath" -Level SUCCESS
+                    $uninstalled = $true
+                    break
+                }
+            } catch {
+                Write-Log "    Failed to run uninstaller from: $setupPath" -Level WARNING
+            }
+        }
+    }
+
+    # Wait for uninstall to complete
+    Start-Sleep -Seconds 5
+
+    # ===== 3. Remove AppX Package =====
+    Write-Log "  Removing OneDrive AppX packages..." -Level INFO
+    try {
+        Get-AppxPackage -AllUsers -Name '*OneDrive*' -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                try {
+                    Remove-AppxPackage -Package $_.PackageFullName -AllUsers -ErrorAction Stop
+                    Write-Log "    Removed AppX: $($_.Name)" -Level SUCCESS
+                } catch {
+                    # Try without AllUsers
+                    try {
+                        Remove-AppxPackage -Package $_.PackageFullName -ErrorAction SilentlyContinue
+                    } catch { }
+                }
+            }
+    } catch { }
+
+    # Remove provisioned package to prevent reinstall for new users
+    try {
+        Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like '*OneDrive*' } |
+            ForEach-Object {
+                try {
+                    Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -ErrorAction Stop | Out-Null
+                    Write-Log "    Removed provisioned package: $($_.DisplayName)" -Level SUCCESS
+                } catch { }
+            }
+    } catch { }
+
+    # ===== 4. Stop and Disable OneSyncSvc Service =====
+    Write-Log "  Disabling OneDrive sync services..." -Level INFO
+    $servicesToDisable = @('OneSyncSvc', 'OneSyncSvc_*')
+    foreach ($svcPattern in $servicesToDisable) {
+        Get-Service -Name $svcPattern -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                Stop-Service -Name $_.Name -Force -ErrorAction SilentlyContinue
+                Set-Service -Name $_.Name -StartupType Disabled -ErrorAction SilentlyContinue
+                Write-Log "    Disabled service: $($_.Name)" -Level SUCCESS
+            } catch { }
+        }
+    }
+
+    # ===== 5. Clean Up OneDrive Folders =====
+    Write-Log "  Removing OneDrive folders..." -Level INFO
+    $foldersToRemove = @(
+        "$env:LOCALAPPDATA\Microsoft\OneDrive",
+        "$env:LOCALAPPDATA\OneDrive",
+        "$env:ProgramData\Microsoft OneDrive",
+        "$env:USERPROFILE\OneDrive",
+        "$env:SystemDrive\OneDriveTemp",
+        "$env:ProgramFiles\Microsoft OneDrive",
+        "${env:ProgramFiles(x86)}\Microsoft OneDrive"
+    )
+
+    # Also remove OneDrive folders for all user profiles
+    $userProfiles = Get-ChildItem -Path "$env:SystemDrive\Users" -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notin @('Public', 'Default', 'Default User', 'All Users') }
+
+    foreach ($profile in $userProfiles) {
+        $foldersToRemove += "$($profile.FullName)\OneDrive"
+        $foldersToRemove += "$($profile.FullName)\AppData\Local\Microsoft\OneDrive"
+    }
+
+    foreach ($folder in $foldersToRemove) {
+        if (Test-Path $folder) {
+            try {
+                Remove-Item -Path $folder -Recurse -Force -ErrorAction Stop
+                Write-Log "    Removed folder: $folder" -Level SUCCESS
+            } catch {
+                # Try with robocopy empty folder trick for stubborn folders
+                try {
+                    $emptyDir = "$env:TEMP\EmptyDir_$(Get-Random)"
+                    New-Item -Path $emptyDir -ItemType Directory -Force | Out-Null
+                    & robocopy $emptyDir $folder /MIR /R:1 /W:1 2>&1 | Out-Null
+                    Remove-Item -Path $folder -Recurse -Force -ErrorAction SilentlyContinue
+                    Remove-Item -Path $emptyDir -Force -ErrorAction SilentlyContinue
+                } catch { }
+            }
+        }
+    }
+
+    # ===== 6. Clean Up Registry =====
+    Write-Log "  Cleaning OneDrive registry entries..." -Level INFO
+
+    # Remove OneDrive from Explorer sidebar (for current user and default)
+    $explorerClsids = @(
+        'HKCR:\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}',
+        'HKCR:\Wow6432Node\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}',
+        'Registry::HKEY_CLASSES_ROOT\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}',
+        'Registry::HKEY_CLASSES_ROOT\Wow6432Node\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}'
+    )
+    foreach ($clsid in $explorerClsids) {
+        try {
+            if (Test-Path $clsid) {
+                Set-ItemProperty -Path $clsid -Name 'System.IsPinnedToNameSpaceTree' -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+                Write-Log "    Removed OneDrive from Explorer sidebar" -Level SUCCESS
+            }
+        } catch { }
+    }
+
+    # Remove OneDrive auto-start entries
+    $autoStartPaths = @(
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'
+    )
+    foreach ($regPath in $autoStartPaths) {
+        try {
+            $props = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
+            if ($props.OneDrive) {
+                Remove-ItemProperty -Path $regPath -Name 'OneDrive' -Force -ErrorAction SilentlyContinue
+                Write-Log "    Removed OneDrive auto-start from: $regPath" -Level SUCCESS
+            }
+            if ($props.OneDriveSetup) {
+                Remove-ItemProperty -Path $regPath -Name 'OneDriveSetup' -Force -ErrorAction SilentlyContinue
+            }
+        } catch { }
+    }
+
+    # Remove OneDrive configuration registry keys
+    $regKeysToRemove = @(
+        'HKCU:\SOFTWARE\Microsoft\OneDrive',
+        'HKLM:\SOFTWARE\Microsoft\OneDrive',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\OneDrive',
+        'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive'
+    )
+    foreach ($regKey in $regKeysToRemove) {
+        try {
+            if (Test-Path $regKey) {
+                Remove-Item -Path $regKey -Recurse -Force -ErrorAction SilentlyContinue
+                Write-Log "    Removed registry key: $regKey" -Level SUCCESS
+            }
+        } catch { }
+    }
+
+    # ===== 7. Prevent OneDrive Reinstallation via Group Policy =====
+    Write-Log "  Setting policies to prevent OneDrive reinstallation..." -Level INFO
+    $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive'
+    try {
+        if (-not (Test-Path $policyPath)) {
+            New-Item -Path $policyPath -Force | Out-Null
+        }
+        # DisableFileSyncNGSC = 1 prevents OneDrive from being used for file storage
+        Set-ItemProperty -Path $policyPath -Name 'DisableFileSyncNGSC' -Value 1 -Type DWord -Force
+        # DisableLibrariesDefaultSaveToOneDrive = 1 prevents default save to OneDrive
+        Set-ItemProperty -Path $policyPath -Name 'DisableLibrariesDefaultSaveToOneDrive' -Value 1 -Type DWord -Force
+        Write-Log "    Group Policy set to prevent OneDrive reinstallation" -Level SUCCESS
+    } catch {
+        Write-Log "    Failed to set OneDrive Group Policy: $($_.Exception.Message)" -Level WARNING
+    }
+
+    # ===== 8. Remove OneDrive Scheduled Tasks =====
+    Write-Log "  Removing OneDrive scheduled tasks..." -Level INFO
+    try {
+        Get-ScheduledTask -TaskName '*OneDrive*' -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                Unregister-ScheduledTask -TaskName $_.TaskName -Confirm:$false -ErrorAction Stop
+                Write-Log "    Removed scheduled task: $($_.TaskName)" -Level SUCCESS
+            } catch { }
+        }
+    } catch { }
+
+    Write-Log "OneDrive removal complete" -Level SUCCESS
+}
+
+# Execute OneDrive removal
+Remove-OneDriveCompletely
+
+# =========================
 # 1) Create local admin
 # =========================
 Write-Log "SERVICE ACCOUNT CREATION" -Level SECTION
