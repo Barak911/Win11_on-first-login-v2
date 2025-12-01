@@ -481,6 +481,295 @@ foreach ($setting in $powerSettings) {
 }
 
 # =========================
+# 6) Bloatware Removal
+# =========================
+Write-Log "BLOATWARE REMOVAL" -Level SECTION
+
+function Remove-Bloatware {
+    <#
+    .SYNOPSIS
+        Removes Windows bloatware by name - handles AppX packages, provisioned packages, and Win32 programs.
+    .PARAMETER Name
+        The name (or partial name) of the software to remove. Supports wildcards.
+    .EXAMPLE
+        Remove-Bloatware -Name "Xbox"
+        Remove-Bloatware -Name "OneDrive"
+        Remove-Bloatware -Name "*Candy*"
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Name
+    )
+
+    $removed = $false
+    $searchPattern = "*$Name*"
+
+    # ===== 1. Remove AppX Packages (Modern/Store Apps) =====
+    try {
+        $appxPackages = Get-AppxPackage -AllUsers -Name $searchPattern -ErrorAction SilentlyContinue
+        foreach ($pkg in $appxPackages) {
+            try {
+                Write-Log "  Removing AppX: $($pkg.Name)" -Level INFO
+                Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction Stop
+                $removed = $true
+                Write-Log "    Removed AppX package" -Level SUCCESS
+            } catch {
+                # Try without -AllUsers for current user only
+                try {
+                    Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction Stop
+                    $removed = $true
+                    Write-Log "    Removed AppX package (current user)" -Level SUCCESS
+                } catch {
+                    Write-Log "    Failed to remove AppX: $($_.Exception.Message)" -Level WARNING
+                }
+            }
+        }
+    } catch {
+        # Silently continue if Get-AppxPackage fails
+    }
+
+    # ===== 2. Remove Provisioned AppX Packages (Prevents reinstall for new users) =====
+    try {
+        $provisionedPackages = Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -like $searchPattern -or $_.PackageName -like $searchPattern }
+        foreach ($pkg in $provisionedPackages) {
+            try {
+                Write-Log "  Removing Provisioned: $($pkg.DisplayName)" -Level INFO
+                Remove-AppxProvisionedPackage -Online -PackageName $pkg.PackageName -ErrorAction Stop | Out-Null
+                $removed = $true
+                Write-Log "    Removed provisioned package" -Level SUCCESS
+            } catch {
+                Write-Log "    Failed to remove provisioned: $($_.Exception.Message)" -Level WARNING
+            }
+        }
+    } catch {
+        # Silently continue if provisioned package removal fails
+    }
+
+    # ===== 3. Remove Win32 Programs via Registry Uninstall =====
+    $uninstallPaths = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+
+    foreach ($path in $uninstallPaths) {
+        try {
+            $programs = Get-ItemProperty $path -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName -like $searchPattern }
+
+            foreach ($program in $programs) {
+                $uninstallString = $program.UninstallString
+                $quietUninstall = $program.QuietUninstallString
+
+                if ($quietUninstall) {
+                    $uninstallCmd = $quietUninstall
+                } elseif ($uninstallString) {
+                    $uninstallCmd = $uninstallString
+                } else {
+                    continue
+                }
+
+                Write-Log "  Removing Win32: $($program.DisplayName)" -Level INFO
+
+                try {
+                    # Handle different uninstall string formats
+                    if ($uninstallCmd -match '^msiexec') {
+                        # MSI uninstall - add quiet flags
+                        $uninstallCmd = $uninstallCmd -replace '/I', '/X'
+                        if ($uninstallCmd -notmatch '/q') {
+                            $uninstallCmd += ' /qn /norestart'
+                        }
+                        Start-Process -FilePath 'cmd.exe' -ArgumentList "/c $uninstallCmd" -Wait -NoNewWindow -ErrorAction Stop
+                    }
+                    elseif ($uninstallCmd -match '\.exe') {
+                        # EXE uninstall - try to run with silent flags
+                        # Extract exe path (handle quoted paths)
+                        if ($uninstallCmd -match '^"([^"]+)"(.*)$') {
+                            $exePath = $Matches[1]
+                            $args = $Matches[2].Trim()
+                        } elseif ($uninstallCmd -match '^(\S+\.exe)(.*)$') {
+                            $exePath = $Matches[1]
+                            $args = $Matches[2].Trim()
+                        } else {
+                            $exePath = $uninstallCmd
+                            $args = ''
+                        }
+
+                        # Add common silent flags if not present
+                        if ($args -notmatch '/S|/silent|/quiet|-silent|-quiet|/qn') {
+                            $args += ' /S /silent /quiet'
+                        }
+
+                        if (Test-Path $exePath) {
+                            Start-Process -FilePath $exePath -ArgumentList $args -Wait -NoNewWindow -ErrorAction Stop
+                        } else {
+                            Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"$uninstallCmd`"" -Wait -NoNewWindow -ErrorAction Stop
+                        }
+                    }
+                    else {
+                        # Generic command
+                        Start-Process -FilePath 'cmd.exe' -ArgumentList "/c $uninstallCmd" -Wait -NoNewWindow -ErrorAction Stop
+                    }
+
+                    $removed = $true
+                    Write-Log "    Removed Win32 program" -Level SUCCESS
+                } catch {
+                    Write-Log "    Failed to remove Win32: $($_.Exception.Message)" -Level WARNING
+                }
+            }
+        } catch {
+            # Continue to next path
+        }
+    }
+
+    # ===== 4. Special Case: OneDrive =====
+    if ($Name -like '*OneDrive*' -or $Name -like '*one drive*') {
+        Write-Log "  Attempting OneDrive removal (special handler)" -Level INFO
+
+        # Stop OneDrive processes
+        Get-Process -Name 'OneDrive' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Get-Process -Name 'OneDriveSetup' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+
+        # Find and run OneDrive uninstaller
+        $oneDrivePaths = @(
+            "$env:SystemRoot\System32\OneDriveSetup.exe",
+            "$env:SystemRoot\SysWOW64\OneDriveSetup.exe",
+            "$env:LOCALAPPDATA\Microsoft\OneDrive\OneDriveSetup.exe",
+            "$env:ProgramFiles\Microsoft OneDrive\OneDriveSetup.exe",
+            "${env:ProgramFiles(x86)}\Microsoft OneDrive\OneDriveSetup.exe"
+        )
+
+        foreach ($odPath in $oneDrivePaths) {
+            if (Test-Path $odPath) {
+                try {
+                    Start-Process -FilePath $odPath -ArgumentList '/uninstall' -Wait -NoNewWindow -ErrorAction Stop
+                    $removed = $true
+                    Write-Log "    OneDrive uninstalled via $odPath" -Level SUCCESS
+                    break
+                } catch {
+                    Write-Log "    OneDrive uninstall failed from $odPath" -Level WARNING
+                }
+            }
+        }
+
+        # Clean up OneDrive folders and registry
+        $oneDriveFolders = @(
+            "$env:LOCALAPPDATA\Microsoft\OneDrive",
+            "$env:ProgramData\Microsoft OneDrive",
+            "$env:USERPROFILE\OneDrive"
+        )
+        foreach ($folder in $oneDriveFolders) {
+            if (Test-Path $folder) {
+                try {
+                    Remove-Item -Path $folder -Recurse -Force -ErrorAction SilentlyContinue
+                } catch { }
+            }
+        }
+
+        # Remove OneDrive from Explorer sidebar
+        $regPaths = @(
+            'HKCR:\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}',
+            'HKCR:\Wow6432Node\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}'
+        )
+        foreach ($regPath in $regPaths) {
+            try {
+                if (Test-Path $regPath) {
+                    Set-ItemProperty -Path $regPath -Name 'System.IsPinnedToNameSpaceTree' -Value 0 -ErrorAction SilentlyContinue
+                }
+            } catch { }
+        }
+    }
+
+    return $removed
+}
+
+# List of bloatware to remove
+$BloatwareList = @(
+    # Microsoft Bloatware
+    'Microsoft.3DBuilder',
+    'Microsoft.549981C3F5F10',      # Cortana
+    'Microsoft.Advertising.Xaml',
+    'Microsoft.BingFinance',
+    'Microsoft.BingNews',
+    'Microsoft.BingSports',
+    'Microsoft.BingTranslator',
+    'Microsoft.BingWeather',
+    'Microsoft.GetHelp',
+    'Microsoft.Getstarted',
+    'Microsoft.Messaging',
+    'Microsoft.Microsoft3DViewer',
+    'Microsoft.MicrosoftOfficeHub',
+    'Microsoft.MicrosoftSolitaireCollection',
+    'Microsoft.MixedReality.Portal',
+    'Microsoft.NetworkSpeedTest',
+    'Microsoft.News',
+    'Microsoft.Office.Lens',
+    'Microsoft.Office.OneNote',
+    'Microsoft.Office.Sway',
+    'Microsoft.OneConnect',
+    'Microsoft.People',
+    'Microsoft.Print3D',
+    'Microsoft.SkypeApp',
+    'Microsoft.StorePurchaseApp',
+    'Microsoft.Wallet',
+    'Microsoft.Whiteboard',
+    'Microsoft.WindowsAlarms',
+    'Microsoft.WindowsCommunicationsApps',  # Mail & Calendar
+    'Microsoft.WindowsFeedbackHub',
+    'Microsoft.WindowsMaps',
+    'Microsoft.WindowsSoundRecorder',
+    'Microsoft.YourPhone',
+    'Microsoft.ZuneMusic',
+    'Microsoft.ZuneVideo',
+    'MicrosoftTeams',
+    'Microsoft.Todos',
+    'Microsoft.PowerAutomateDesktop',
+    'Microsoft.GamingApp',
+    'Microsoft.MicrosoftStickyNotes',
+    'Clipchamp.Clipchamp',
+
+    # Xbox Apps
+    'Microsoft.Xbox.TCUI',
+    'Microsoft.XboxApp',
+    'Microsoft.XboxGameOverlay',
+    'Microsoft.XboxGamingOverlay',
+    'Microsoft.XboxIdentityProvider',
+    'Microsoft.XboxSpeechToTextOverlay',
+
+    # Third-party Bloatware
+    'king.com.CandyCrushSaga',
+    'king.com.CandyCrushSodaSaga',
+    'king.com.BubbleWitch3Saga',
+    'king.com.CandyCrushFriends',
+    'FACEBOOK.FACEBOOK',
+    'Flipboard.Flipboard',
+    'Twitter.Twitter',
+    'SpotifyAB.SpotifyMusic',
+    'Disney.37853FC22B2CE',         # Disney+
+    'BytedancePte.Ltd.TikTok',
+    'AmazonVideo.PrimeVideo',
+    '22364Disney.ESPNBetaPWA',
+
+    # OneDrive (handled specially)
+    'OneDrive'
+)
+
+$removedCount = 0
+$failedCount = 0
+
+foreach ($bloat in $BloatwareList) {
+    Write-Log "Processing: $bloat" -Level INFO
+    $result = Remove-Bloatware -Name $bloat
+    if ($result) {
+        $removedCount++
+    }
+}
+
+Write-Log "Bloatware removal complete: $removedCount items processed" -Level SUCCESS
+
+# =========================
 # Helper: Copy with progress
 # =========================
 function Copy-FolderWithProgress {
