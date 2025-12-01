@@ -61,6 +61,9 @@ $InstallerName = "SQLEXPR_x64_ENU.exe"
 $ConfigFileName = "ConfigurationFileX64.ini"
 $UpdateName = "SQLServer2022-KB5050771-x64.exe"
 
+# Primary installation path (copied by on-first-login-v2.ps1)
+$PrimaryInstallPath = "C:\danyel\Cytiva\SQL\SQL Server 2022"
+
 # =========================
 # FIND INSTALLATION MEDIA
 # =========================
@@ -69,8 +72,17 @@ Write-Log "Searching for SQL Server 2022 installation media..." -Level INFO
 function Find-SQLServerMedia {
     param(
         [string]$FolderName,
-        [string]$InstallerName
+        [string]$InstallerName,
+        [string]$PrimaryPath
     )
+
+    # First check the primary local path (C:\danyel\Cytiva\SQL\SQL Server 2022)
+    if ($PrimaryPath -and (Test-Path $PrimaryPath)) {
+        $installerPath = Join-Path $PrimaryPath $InstallerName
+        if (Test-Path $installerPath) {
+            return $PrimaryPath
+        }
+    }
 
     # Search on CD/DVD drives (DriveType = 5)
     foreach ($drive in (Get-CimInstance Win32_LogicalDisk -Filter "DriveType=5" -ErrorAction SilentlyContinue)) {
@@ -117,7 +129,7 @@ function Find-SQLServerMedia {
     return $null
 }
 
-$MediaPath = Find-SQLServerMedia -FolderName $SQLServerFolder -InstallerName $InstallerName
+$MediaPath = Find-SQLServerMedia -FolderName $SQLServerFolder -InstallerName $InstallerName -PrimaryPath $PrimaryInstallPath
 
 if (-not $MediaPath) {
     Write-Log "SQL Server 2022 installation media not found!" -Level ERROR
