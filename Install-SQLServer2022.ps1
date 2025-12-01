@@ -167,23 +167,72 @@ try {
     Write-Log "Could not read config file, proceeding with installation anyway" -Level WARNING
 }
 
-# Build installation arguments
-# /CONFIGURATIONFILE - Path to configuration file
-# /IACCEPTSQLSERVERLICENSETERMS - Accept license terms
-# /Q or /QS - Quiet mode (/Q = fully quiet, /QS = quiet with progress UI)
-# /HIDECONSOLE - Hide console window
-$installArgs = @(
-    "/CONFIGURATIONFILE=`"$ConfigPath`"",
-    "/IACCEPTSQLSERVERLICENSETERMS",
-    "/QS",
-    "/HIDECONSOLE"
-)
+# ============================================================================
+# IMPORTANT: SQLEXPR_x64_ENU.exe has a bug where /ConfigurationFile parameter
+# is NOT passed to setup.exe. The workaround is to:
+# 1. Extract the installer to a temp folder
+# 2. Run setup.exe directly from the extracted folder
+# Reference: https://learn.microsoft.com/en-us/answers/questions/1341589/
+# ============================================================================
 
-Write-Log "Starting SQL Server 2022 installation..." -Level INFO
-Write-Log "This may take 10-20 minutes. Please wait..." -Level INFO
+$ExtractPath = "$env:TEMP\SQLServer2022_Extract"
+
+# Clean up any previous extraction
+if (Test-Path $ExtractPath) {
+    Write-Log "Cleaning up previous extraction folder..." -Level INFO
+    Remove-Item -Path $ExtractPath -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# Step 1: Extract the installer silently
+Write-Log "Step 1: Extracting SQL Server installer..." -Level INFO
+Write-Log "  Extracting to: $ExtractPath" -Level INFO
 
 try {
-    $installProcess = Start-Process -FilePath $InstallerPath `
+    $extractProcess = Start-Process -FilePath $InstallerPath `
+                                     -ArgumentList "/q", "/x:`"$ExtractPath`"" `
+                                     -Wait `
+                                     -PassThru `
+                                     -NoNewWindow `
+                                     -ErrorAction Stop
+
+    if ($extractProcess.ExitCode -ne 0) {
+        Write-Log "Extraction failed with exit code: $($extractProcess.ExitCode)" -Level ERROR
+        Stop-Transcript
+        exit 1
+    }
+    Write-Log "  Extraction complete" -Level SUCCESS
+} catch {
+    Write-Log "Failed to extract installer: $($_.Exception.Message)" -Level ERROR
+    Stop-Transcript
+    exit 1
+}
+
+# Verify setup.exe exists
+$SetupExePath = Join-Path $ExtractPath "setup.exe"
+if (-not (Test-Path $SetupExePath)) {
+    Write-Log "setup.exe not found in extraction folder!" -Level ERROR
+    Stop-Transcript
+    exit 1
+}
+
+# Step 2: Run setup.exe with configuration file (fully silent)
+Write-Log "Step 2: Running SQL Server setup (silent)..." -Level INFO
+Write-Log "This may take 10-20 minutes. Please wait..." -Level INFO
+
+# Build installation arguments for setup.exe
+# /Q = Fully quiet (no UI at all)
+# /IACCEPTSQLSERVERLICENSETERMS = Accept license
+# /CONFIGURATIONFILE = Path to configuration file
+$installArgs = @(
+    "/Q",
+    "/IACCEPTSQLSERVERLICENSETERMS",
+    "/CONFIGURATIONFILE=`"$ConfigPath`""
+)
+
+Write-Log "  Command: setup.exe $($installArgs -join ' ')" -Level INFO
+
+try {
+    $installProcess = Start-Process -FilePath $SetupExePath `
                                      -ArgumentList $installArgs `
                                      -Wait `
                                      -PassThru `
@@ -214,6 +263,10 @@ try {
     Stop-Transcript
     exit 1
 }
+
+# Clean up extraction folder
+Write-Log "Cleaning up extraction folder..." -Level INFO
+Remove-Item -Path $ExtractPath -Recurse -Force -ErrorAction SilentlyContinue
 
 # =========================
 # VERIFY INSTALLATION
