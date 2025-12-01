@@ -627,29 +627,6 @@ function Install-DriversForPresentDevices {
                             $deviceLookup[$shortKey] += $device
                         }
                     }
-
-                    # Handle SWC (Software Component) hardware IDs - normalize VID format variations
-                    # Device might report SWC\VID8086_... but INF has SWC\VID_8086_... or vice versa
-                    if ($key -match '^SWC\\VID([0-9A-F]{4})(.*)$') {
-                        # Store variant with underscore: SWC\VID_XXXX...
-                        $altKey = "SWC\VID_$($Matches[1])$($Matches[2])"
-                        if (-not $deviceLookup.ContainsKey($altKey)) {
-                            $deviceLookup[$altKey] = @()
-                        }
-                        if ($deviceLookup[$altKey] -notcontains $device) {
-                            $deviceLookup[$altKey] += $device
-                        }
-                    }
-                    elseif ($key -match '^SWC\\VID_([0-9A-F]{4})(.*)$') {
-                        # Store variant without underscore: SWC\VIDXXXX...
-                        $altKey = "SWC\VID$($Matches[1])$($Matches[2])"
-                        if (-not $deviceLookup.ContainsKey($altKey)) {
-                            $deviceLookup[$altKey] = @()
-                        }
-                        if ($deviceLookup[$altKey] -notcontains $device) {
-                            $deviceLookup[$altKey] += $device
-                        }
-                    }
                 }
             }
         } catch {
