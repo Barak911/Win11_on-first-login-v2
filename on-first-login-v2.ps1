@@ -927,7 +927,6 @@ $BloatwareList = @(
     'Microsoft.Getstarted',
     'Microsoft.Messaging',
     'Microsoft.Microsoft3DViewer',
-    'Microsoft.MicrosoftOfficeHub',
     'Microsoft.MicrosoftSolitaireCollection',
     'Microsoft.MixedReality.Portal',
     'Microsoft.NetworkSpeedTest',
@@ -937,7 +936,6 @@ $BloatwareList = @(
     'Microsoft.Office.Sway',
     'Microsoft.OneConnect',
     'Microsoft.People',
-    'Microsoft.Print3D',
     'Microsoft.SkypeApp',
     'Microsoft.StorePurchaseApp',
     'Microsoft.Wallet',
@@ -950,7 +948,6 @@ $BloatwareList = @(
     'Microsoft.YourPhone',
     'Microsoft.ZuneMusic',
     'Microsoft.ZuneVideo',
-    'MicrosoftTeams',
     'Microsoft.Todos',
     'Microsoft.PowerAutomateDesktop',
     'Microsoft.GamingApp',
@@ -1628,4 +1625,5 @@ Write-Log "System will restart in 10 seconds..." -Level WARNING
 
 Stop-Transcript
 #Start-Sleep 10
+
 #Restart-Computer -Force
